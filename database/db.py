@@ -37,6 +37,16 @@ try:
 except ImportError:
     _GSPREAD_AVAILABLE = False
 
+# streamlit 同样按可选依赖处理（任务1：用于检测 st.secrets 是否包含
+# Google Service Account 配置）。db.py 在被 app.py import 时 streamlit
+# 必然可用；但本文件也支持被独立脚本调用（见文末 if __name__ == "__main__"
+# 自检块），那种场景下不强制要求 streamlit 已安装。
+try:
+    import streamlit as st
+    _STREAMLIT_AVAILABLE = True
+except ImportError:
+    _STREAMLIT_AVAILABLE = False
+
 
 CREDENTIALS_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -66,6 +76,45 @@ SCOPES = [
 _worksheet_cache = None  # 模块级缓存，避免每次调用都重新认证
 
 
+def _load_credentials_from_secrets():
+    """
+    任务1：检测 st.secrets 中是否存在 Google Service Account 配置。
+
+    优先查找的 key 名为 "gcp_service_account"（Streamlit 官方文档推荐的
+    标准约定，参见 docs.streamlit.io 的 Google Sheets 连接教程）。
+    如果你的 secrets.toml / Streamlit Cloud Secrets 中使用了不同的 key 名，
+    请同步修改下面的 _SECRETS_KEY 常量，不需要改动其他逻辑。
+
+    返回：
+        dict —— 找到凭证配置时，返回可直接 json.dump 的凭证字典
+        None —— 本地开发环境（无 st.secrets 或其中没有该 key）时返回 None，
+                调用方据此回退到本地 credentials.json，不影响本地行为。
+    """
+    if not _STREAMLIT_AVAILABLE:
+        return None
+
+    _SECRETS_KEY = "gcp_service_account"
+
+    try:
+        # st.secrets 在本地没有 .streamlit/secrets.toml 时访问会抛异常，
+        # 用 try/except 而不是 "in" 判断，兼容所有 Streamlit 版本的行为差异。
+        if _SECRETS_KEY not in st.secrets:
+            return None
+        secrets_section = st.secrets[_SECRETS_KEY]
+    except Exception:
+        # 本地未配置 st.secrets 是完全正常的情况（本地开发场景），
+        # 静默返回 None，不打印警告，避免本地开发时产生误导性输出。
+        return None
+
+    try:
+        # st.secrets 返回的是 AttrDict，转成普通 dict 才能被 json.dump 序列化
+        return dict(secrets_section)
+    except Exception as e:
+        print(f"[db.py] 警告：st.secrets['{_SECRETS_KEY}'] 存在但格式无法解析（{e}），"
+              "尝试回退到本地 credentials.json。")
+        return None
+
+
 def _get_worksheet():
     """
     返回已打开的 worksheet 对象；任何环节失败都返回 None 并打印警告，
@@ -80,15 +129,50 @@ def _get_worksheet():
               "请运行 pip install gspread google-auth")
         return None
 
-    if not os.path.exists(CREDENTIALS_PATH):
-        print(f"[db.py] 警告：未找到凭证文件 {CREDENTIALS_PATH}，决策日志功能不可用。")
-        return None
+    # ---- 任务1：本地 credentials.json 与 Streamlit Cloud st.secrets 兼容 ----
+    # 优先级：st.secrets 中存在 Google Service Account 配置 -> 用它（云端场景）；
+    #        否则退回读取本地 credentials.json（本地开发场景，行为完全不变）。
+    # 两条路径最终都调用同一个 gspread.service_account(filename=...)，
+    # 区别只在于这个 filename 指向的是本地原文件还是临时生成的文件。
+    client = None
+    tmp_credentials_path = None
 
-    try:
-        client = gspread.service_account(filename=CREDENTIALS_PATH)
-    except Exception as e:
-        print(f"[db.py] 警告：Google Sheets 认证失败（{e}），决策日志功能不可用。")
-        return None
+    secrets_dict = _load_credentials_from_secrets()
+    if secrets_dict is not None:
+        try:
+            import tempfile
+            # 用 tempfile 创建临时凭证文件，写入后立即用于认证，
+            # finally 块确保 _get_worksheet 返回前一定清理掉这个临时文件，
+            # 不在磁盘上长期保留 Service Account 私钥的明文副本。
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False, encoding="utf-8"
+            ) as tmp_file:
+                json.dump(secrets_dict, tmp_file)
+                tmp_credentials_path = tmp_file.name
+
+            client = gspread.service_account(filename=tmp_credentials_path)
+        except Exception as e:
+            print(f"[db.py] 警告：从 st.secrets 读取 Google 凭证失败（{e}），"
+                  "尝试回退到本地 credentials.json。")
+            client = None
+        finally:
+            if tmp_credentials_path is not None and os.path.exists(tmp_credentials_path):
+                try:
+                    os.remove(tmp_credentials_path)
+                except Exception:
+                    pass  # 清理失败不影响主流程，临时文件位于系统临时目录，不影响功能
+
+    if client is None:
+        # 本地开发路径：与修改前完全一致的行为
+        if not os.path.exists(CREDENTIALS_PATH):
+            print(f"[db.py] 警告：未找到凭证文件 {CREDENTIALS_PATH}，决策日志功能不可用。")
+            return None
+
+        try:
+            client = gspread.service_account(filename=CREDENTIALS_PATH)
+        except Exception as e:
+            print(f"[db.py] 警告：Google Sheets 认证失败（{e}），决策日志功能不可用。")
+            return None
 
     try:
         spreadsheet = client.open(SPREADSHEET_NAME)

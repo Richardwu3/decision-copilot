@@ -118,6 +118,19 @@ def compute_feature_attribution(feat_row: sqlite3.Row, coef_data: dict, target: 
     显得贡献度异常夸大，量级小的特征（如 home_adv 取值 0/1）被严重低估。
     这一步只是把训练时已经存在的 scaler 参数应用回特征值，不引入任何新计算逻辑。
 
+    任务3修复：home_adv 是二元类别特征（1=主场，0=中立场），不是连续数值特征。
+    标准化公式 (raw-mean)/scale 对它在数学上依然成立，但业务含义会失真——
+    训练集里大多数比赛是主场赛事，mean≈0.5-0.7（不是0.5正中间），
+    导致 home_adv=0（中立场）标准化后变成一个较大的负值，乘以系数后
+    呈现出"中立场对主队不利"这种误导性的强烈负贡献。但中立场地的实际
+    业务含义是"主客双方都不享有主场优势"，对结果的影响应当是 0，
+    不应该被解读成对主队的惩罚。因此对 home_adv 单独处理：
+      - home_adv == 0（中立场）：contribution 强制为 0，不参与标准化计算
+      - home_adv == 1（主场）：正常走标准化×系数的计算路径
+    无论 target 是 home_goals 还是 away_goals，这个特殊处理逻辑都一致生效
+    （因为判断条件只依赖 raw_value 本身，不依赖 target 分支选了哪组系数）。
+    不影响其他任何特征的计算路径，也不改变模型预测本身（只影响展示层归因）。
+
     返回：[(feature_name, contribution), ...] 按贡献度绝对值不排序，原始顺序返回。
     """
     if coef_data is None or feat_row is None:
@@ -160,12 +173,19 @@ def compute_feature_attribution(feat_row: sqlite3.Row, coef_data: dict, target: 
         if raw_value is None:
             continue
 
+        display_name = FEATURE_DISPLAY_NAMES.get(train_col, train_col)
+
+        # 任务3：home_adv 在中立场地（raw_value == 0）时，贡献度直接归零，
+        # 跳过标准化×系数的通用计算路径，避免出现误导性的负贡献展示。
+        if train_col == "home_adv" and raw_value == 0:
+            contributions.append((display_name, 0.0))
+            continue
+
         mean = means[i]
         scale = scales[i] if scales[i] != 0 else 1.0
         standardized = (raw_value - mean) / scale
         contribution = standardized * coefs[i]
 
-        display_name = FEATURE_DISPLAY_NAMES.get(train_col, train_col)
         contributions.append((display_name, contribution))
 
     return contributions
@@ -557,7 +577,11 @@ def render_match_detail(conn: sqlite3.Connection, match_id, user_name: str):
 
         actual_home_xg = odds_raw.get("home_xg")
         actual_away_xg = odds_raw.get("away_xg")
-        if actual_home_xg is not None and actual_away_xg is not None:
+        # Bug修复（任务2）：pandas 读取 Excel 时缺失的数值会变成 NaN（float类型），
+        # 不是 None。`NaN is not None` 恒为 True，原判断会让 NaN 漏网，
+        # 格式化后显示成字面文本 "nan : nan"。改用 pd.notna() 同时排除
+        # None 和 NaN 两种缺失值表示形式。
+        if pd.notna(actual_home_xg) and pd.notna(actual_away_xg):
             st.write(f"**预期进球：{actual_home_xg:.1f} : {actual_away_xg:.1f}**")
 
         st.caption(f"{match['date']} · {match['venue'] or '场地待定'}")
@@ -781,8 +805,53 @@ def run_dashboard_page():
         render_match_detail(conn, st.session_state["selected_match_id"], user_name)
 
 
+# ============================================================
+# 任务2：应用启动时自动导入比赛结果（幂等，避免重复导入）
+# ============================================================
+
+def _results_table_has_data(conn: sqlite3.Connection) -> bool:
+    """
+    检查 SQLite 的 results 表是否已经存在至少一条 is_finished=1 的记录。
+    用作自动导入的幂等性判断依据：数据库里有数据就跳过，没有才导入。
+
+    注意：这里用数据库状态本身做判断，而不是 st.session_state——
+    因为 session_state 只在单个浏览器 session 内有效，Streamlit Cloud
+    上不同用户访问会各自建立新 session，如果用 session_state 判断，
+    每个新用户首次访问都会重新触发一次导入（虽然 save_result 是幂等的，
+    不会产生脏数据，但会造成不必要的重复 IO）。用数据库状态判断则是
+    真正"全局只导入一次"，与谁访问、访问几次无关。
+    """
+    cur = conn.execute("SELECT COUNT(*) FROM results WHERE is_finished = 1")
+    count = cur.fetchone()[0]
+    return count > 0
+
+
+def _auto_import_results_if_needed(conn: sqlite3.Connection) -> None:
+    """
+    应用启动时调用：如果 results 表为空（没有任何已结束比赛记录），
+    自动从 data/schedule_2026_result.xls 导入一次。
+
+    失败时只打印警告，不阻断应用启动（与本项目其他外部数据源
+    一致的降级原则：缺数据时功能降级展示，不让整个应用崩溃）。
+    """
+    try:
+        if _results_table_has_data(conn):
+            return  # 已有数据，跳过导入
+
+        from import_results import import_results
+        imported = import_results()
+        if imported > 0:
+            print(f"[app.py] 启动时自动导入了 {imported} 场已结束比赛结果。")
+    except Exception as e:
+        print(f"[app.py] 警告：启动时自动导入比赛结果失败（{e}），"
+              "Match Detail 页面的真实比分/xG 展示可能暂时不可用。")
+
+
 def main():
     st.set_page_config(page_title="Decision Review Copilot", layout="wide")
+
+    # ---- 任务2：启动时自动导入比赛结果（幂等）----
+    _auto_import_results_if_needed(get_db_connection())
 
     # ---- st.navigation 多页面入口 ----
     # Dashboard（本文件）与 Review Center（pages/review.py）通过 st.navigation
