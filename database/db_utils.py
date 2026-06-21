@@ -21,12 +21,161 @@ from datetime import datetime
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "decision_copilot.db")
 
+# ============================================================
+# 期望的 schema 定义：表名 -> 该表必须存在的列名集合
+# 与 init_db.py 中 SCHEMA_SQL 实际创建的表/列保持逐项一致。
+# ensure_database_schema() 用这份定义去检查"实际数据库"是否完整，
+# print_database_schema() 用它做调试输出时的参照。
+# ============================================================
+EXPECTED_SCHEMA = {
+    "matches": {
+        "match_id", "date", "home_team", "away_team", "venue",
+        "home_adv", "home_elo", "away_elo", "home_value", "away_value",
+    },
+    "predictions": {
+        "pred_id", "match_id", "pred_date", "model_version",
+        "prob_home", "prob_draw", "prob_away", "lambda_home", "lambda_away",
+    },
+    "prediction_features": {
+        "feature_id", "match_id", "pred_date", "elo_diff", "value_ratio",
+        "weighted_xg_diff", "weighted_xga_diff", "home_adv",
+        "injury_impact_home", "injury_impact_away",
+    },
+    "decision_events": {
+        "event_id", "match_id", "user_name", "timestamp", "event_type",
+        "choice", "confidence", "reason_tags", "reason_detail", "changed_from",
+    },
+    "results": {
+        "match_id", "home_goals", "away_goals", "result", "is_finished",
+    },
+}
+
 
 def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
     """返回一个允许跨线程使用（Streamlit 场景）的数据库连接。"""
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+# ============================================================
+# 健壮的 schema 校验与自动修复（不依赖"文件是否存在"）
+# ============================================================
+
+def _get_existing_tables(conn: sqlite3.Connection) -> set:
+    """返回数据库中当前实际存在的表名集合。"""
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    return {row[0] for row in cur.fetchall()}
+
+
+def _get_existing_columns(conn: sqlite3.Connection, table: str) -> set:
+    """返回某张表当前实际存在的列名集合。表不存在时返回空集合。"""
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return {row[1] for row in cur.fetchall()}  # row[1] 是列名
+
+
+def ensure_database_schema(conn: sqlite3.Connection, db_path: str = DB_PATH) -> sqlite3.Connection:
+    """
+    保证数据库 schema 完整、可用，不依赖"数据库文件是否存在"这个前提
+    （这正是本次 Streamlit Cloud 报错的根因：sqlite3.connect() 在文件
+    不存在时会静默创建一个 0 张表的空文件，旧的判断逻辑"文件存在就跳过初始化"
+    完全检测不出这种情况）。
+
+    检查策略（两层）：
+      1. 轻量修复：任何期望的表不存在 -> 执行 CREATE TABLE IF NOT EXISTS
+         （这一步本身幂等无害，可以放心在每次应用启动时都跑一遍）。
+      2. 重型修复（兜底）：表存在，但其中任何一个必需列缺失
+         -> 说明这是一个结构不兼容的旧版本残留数据库文件，
+            直接删除该数据库文件，重新执行完整 init_database()。
+         这种情况在 MVP 阶段选择"重建优于自动 ALTER"，因为：
+           - 自动推导每一列的 ALTER TABLE ADD COLUMN 语句、处理列类型变化、
+             处理删除列（SQLite 早期版本不支持 DROP COLUMN）等情况复杂度高；
+           - 当前数据量小，重建成本远低于维护一套通用 migration 引擎的成本。
+
+    返回：处理后的同一个 conn（仍然可以继续使用，未关闭）。
+    """
+    from database.init_db import init_database, SCHEMA_SQL  # 延迟导入，避免循环依赖
+
+    existing_tables = _get_existing_tables(conn)
+    missing_tables = set(EXPECTED_SCHEMA.keys()) - existing_tables
+
+    if missing_tables:
+        print(f"[ensure_database_schema] 检测到缺失的表：{missing_tables}，"
+              f"执行 CREATE TABLE IF NOT EXISTS 补全。")
+        conn.executescript(SCHEMA_SQL)
+        conn.commit()
+        existing_tables = _get_existing_tables(conn)
+
+    # 轻量修复后，再次检查每张已存在的表，列是否完整
+    schema_broken = False
+    for table, expected_cols in EXPECTED_SCHEMA.items():
+        if table not in existing_tables:
+            # 理论上不应该再发生（上面刚补全过），但保留判断防止极端竞态
+            schema_broken = True
+            print(f"[ensure_database_schema] 严重：表 {table} 补全后仍不存在。")
+            break
+
+        actual_cols = _get_existing_columns(conn, table)
+        missing_cols = expected_cols - actual_cols
+        if missing_cols:
+            schema_broken = True
+            print(f"[ensure_database_schema] 表 {table} 缺失列：{missing_cols}，"
+                  f"判定为结构不兼容的旧版本 schema。")
+
+    if schema_broken:
+        print(f"[ensure_database_schema] 数据库结构与当前代码不兼容，"
+              f"删除并重建：{db_path}")
+        conn.close()
+        if os.path.exists(db_path):
+            os.remove(db_path)
+        init_database(db_path)
+        conn = get_connection(db_path)
+        print(f"[ensure_database_schema] 数据库已重建完成。")
+    else:
+        print(f"[ensure_database_schema] 数据库 schema 校验通过，共 "
+              f"{len(EXPECTED_SCHEMA)} 张表均完整。")
+
+    return conn
+
+
+# ============================================================
+# 调试工具
+# ============================================================
+
+def print_database_schema(conn: sqlite3.Connection) -> None:
+    """
+    输出当前数据库的完整 schema 信息，用于在 Streamlit Cloud 等
+    远程环境快速定位"实际数据库状态"与"代码期望状态"是否一致。
+
+    输出内容：
+      - SQLite 版本号
+      - 所有表的名称
+      - 每张表的所有字段（名称 + 类型）
+    """
+    print("=" * 60)
+    print("数据库 Schema 调试信息")
+    print("=" * 60)
+
+    cur = conn.execute("SELECT sqlite_version()")
+    version = cur.fetchone()[0]
+    print(f"SQLite 版本：{version}")
+
+    tables = sorted(_get_existing_tables(conn))
+    print(f"共 {len(tables)} 张表：{tables}")
+    print()
+
+    for table in tables:
+        print(f"-- 表：{table}")
+        cur = conn.execute(f"PRAGMA table_info({table})")
+        columns = cur.fetchall()
+        for col in columns:
+            # PRAGMA table_info 返回: (cid, name, type, notnull, dflt_value, pk)
+            cid, name, col_type, notnull, dflt_value, pk = col
+            pk_marker = " [PK]" if pk else ""
+            print(f"    {name:<22} {col_type:<12}{pk_marker}")
+        print()
+
+    print("=" * 60)
 
 
 # ============================================================

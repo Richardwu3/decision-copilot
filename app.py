@@ -44,6 +44,7 @@ import streamlit as st
 
 from database.db_utils import (
     get_connection,
+    ensure_database_schema,
     get_all_matches_with_latest_prediction,
     get_match_full_context,
 )
@@ -95,7 +96,27 @@ INJURY_REPORT_PATH = "data/Injury_report.xlsx"
 
 @st.cache_resource
 def get_db_connection() -> sqlite3.Connection:
-    return get_connection()
+    """
+    全应用唯一的数据库连接入口（@st.cache_resource 保证整个 session
+    乃至跨 rerun 只创建一次连接，不重复打开文件）。
+
+    根因修复：之前这里只是 get_connection()，即 sqlite3.connect(db_path)——
+    该调用在数据库文件不存在时会静默创建一个 0 张表的空文件，不会报错，
+    也不会自动建表。本地开发因为开发者手动运行过 database/init_db.py，
+    问题被掩盖；但 Streamlit Cloud 的每次全新部署都是干净容器，从未有人
+    在其中手动跑过初始化脚本，导致 Dashboard 首次查询 matches 表时
+    抛出 sqlite3.OperationalError: no such table: matches。
+
+    现在改为返回前先调用 ensure_database_schema(conn)：该函数不依赖
+    "文件是否存在"，而是直接检查"所有期望的表和列是否真的存在"，
+    缺失则自动创建/重建。因为本函数是整个应用获取数据库连接的唯一入口
+    （Dashboard、Match Detail、Review Center、自动导入比赛结果等所有
+    代码路径都经过这里），只需要在这一处注入校验，全部调用方自动受益，
+    不需要在每个使用数据库的函数里重复加校验逻辑。
+    """
+    conn = get_connection()
+    conn = ensure_database_schema(conn)
+    return conn
 
 
 @st.cache_data(ttl=5)
