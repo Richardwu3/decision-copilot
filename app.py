@@ -68,12 +68,14 @@ from shared_utils import (
 COEF_PATH = "model_coefficients.json"
 
 # 人类可读的特征名称（仅用于展示，不影响计算）
+# v5 effective_home 方案：is_home 和 home_adv 合并为 effective_home，
+# 数据库存储的 home_adv 字段透传供 DB 写入，不进入归因展示。
 FEATURE_DISPLAY_NAMES = {
-    "elo_diff": "Elo Difference",
+    "elo_diff":        "Elo Difference",
     "log_value_ratio": "Market Value",
-    "weighted_xg_diff": "Attacking Form (xG)",
-    "weighted_xga_diff": "Defensive Form (xGA)",
-    "home_adv": "Home Advantage",
+    "weighted_xg":     "Attacking Form (xG)",
+    "weighted_xga":    "Defensive Form (xGA)",
+    "effective_home":  "Home Advantage",
 }
 
 # REASON_TAG_OPTIONS 已迁移至 shared_utils.py（任务4：恢复决策理由下拉菜单）
@@ -121,7 +123,7 @@ def get_db_connection() -> sqlite3.Connection:
 
 @st.cache_data(ttl=5)
 def load_coefficients():
-    """读取模型系数与标准化参数（由 worldcup_predictor_v3.py 训练时导出）。"""
+    """读取模型系数与标准化参数（由 worldcup_predictor_v5.py 训练时导出）。"""
     if not os.path.exists(COEF_PATH):
         return None
     with open(COEF_PATH, "r", encoding="utf-8") as f:
@@ -136,59 +138,57 @@ def compute_feature_attribution(feat_row: sqlite3.Row, coef_data: dict, target: 
 
     标准化是必须的，因为 Ridge 系数本身是在标准化特征空间训练得到的；
     若直接用原始特征值（如 elo_diff 量级 ±400）乘系数，会让量级大的特征
-    显得贡献度异常夸大，量级小的特征（如 home_adv 取值 0/1）被严重低估。
-    这一步只是把训练时已经存在的 scaler 参数应用回特征值，不引入任何新计算逻辑。
+    显得贡献度异常夸大，量级小的特征（如 effective_home 取值 0/1）被严重低估。
 
-    任务3修复：home_adv 是二元类别特征（1=主场，0=中立场），不是连续数值特征。
-    标准化公式 (raw-mean)/scale 对它在数学上依然成立，但业务含义会失真——
-    训练集里大多数比赛是主场赛事，mean≈0.5-0.7（不是0.5正中间），
-    导致 home_adv=0（中立场）标准化后变成一个较大的负值，乘以系数后
-    呈现出"中立场对主队不利"这种误导性的强烈负贡献。但中立场地的实际
-    业务含义是"主客双方都不享有主场优势"，对结果的影响应当是 0，
-    不应该被解读成对主队的惩罚。因此对 home_adv 单独处理：
-      - home_adv == 0（中立场）：contribution 强制为 0，不参与标准化计算
-      - home_adv == 1（主场）：正常走标准化×系数的计算路径
-    无论 target 是 home_goals 还是 away_goals，这个特殊处理逻辑都一致生效
-    （因为判断条件只依赖 raw_value 本身，不依赖 target 分支选了哪组系数）。
-    不影响其他任何特征的计算路径，也不改变模型预测本身（只影响展示层归因）。
+    v5 effective_home 方案说明：
+      FEATURE_COLS = ["elo_diff", "log_value_ratio", "weighted_xg", "weighted_xga", "effective_home"]
 
-    返回：[(feature_name, contribution), ...] 按贡献度绝对值不排序，原始顺序返回。
+      训练特征（FEATURE_COLS） → 数据库字段（prediction_features 表） 映射：
+        elo_diff        → elo_diff        （直接对应）
+        log_value_ratio → value_ratio     （DB 字段名不同）
+        weighted_xg     → weighted_xg_diff（DB 以主-客差值存储，用作主队相对强弱的近似）
+        weighted_xga    → weighted_xga_diff（同上）
+        effective_home  → home_adv        （DB 存储的是原始 home_adv 字段，见下方说明）
+
+      effective_home 的 DB 读取说明：
+        训练时 effective_home = is_home * home_adv，取值 {0, 1}。
+        DB 存储的 home_adv 字段是比赛级的 {0, 1}，对主场主队而言两者相等
+        （主场主队：effective_home=1*1=1，home_adv=1）；
+        归因展示始终从主队视角出发，因此读取 home_adv 字段等价于读取 effective_home。
+        中立场（home_adv=0）时两者均为 0，贡献为 0，展示一致。
+
+      effective_home == 0（中立场）时：
+        贡献强制为 0（跳过标准化计算），因为中立场主客双方均不享有主场优势，
+        "Home Advantage"对进球数的影响应当展示为 0，不应出现负贡献误导用户。
+
+    target 参数：v5 单模型只有一组系数，target 不影响实际读取，保留仅为接口兼容。
+
+    返回：[(feature_name, contribution), ...] 原始 FEATURE_COLS 顺序返回，未排序。
     """
     if coef_data is None or feat_row is None:
         return []
 
-    feature_cols = coef_data["feature_cols"]  # 训练时的列名（与 prediction_features 表字段名略有差异）
-    # prediction_features 表字段名 -> 训练特征列名 的映射
-    # （value_ratio 对应训练时的 log_value_ratio，weighted_xg/xga 同名）
-    db_field_map = {
-        "elo_diff": "elo_diff",
-        "log_value_ratio": "value_ratio",
-        "weighted_xg_diff": "weighted_xg_diff",
-        "weighted_xga_diff": "weighted_xga_diff",
-        "home_adv": "home_adv",
-    }
-    # 注：weighted_res_diff（xG 残差特征）未持久化到 prediction_features 表，
-    # Phase 1 归因仅覆盖已落库的 5 个特征。
+    feature_cols = coef_data["feature_cols"]  # v5: ["elo_diff","log_value_ratio","weighted_xg","weighted_xga","effective_home"]
 
-    if target == "home_goals":
-        coefs = coef_data["home_goals_coef"]
-        means = coef_data["scaler_home_mean"]
-        scales = coef_data["scaler_home_scale"]
-    else:
-        coefs = coef_data["away_goals_coef"]
-        means = coef_data["scaler_away_mean"]
-        scales = coef_data["scaler_away_scale"]
+    # 训练特征名 → prediction_features 数据库字段名 映射
+    db_field_map = {
+        "elo_diff":        "elo_diff",
+        "log_value_ratio": "value_ratio",
+        "weighted_xg":     "weighted_xg_diff",   # DB 以差值存储，近似主队相对强弱
+        "weighted_xga":    "weighted_xga_diff",  # 同上
+        "effective_home":  "home_adv",            # 主队视角下 effective_home == home_adv
+    }
+
+    # v5 单模型：唯一一组系数，target 参数不影响读取
+    coefs  = coef_data["goals_coef"]
+    means  = coef_data["scaler_mean"]
+    scales = coef_data["scaler_scale"]
 
     contributions = []
     for i, train_col in enumerate(feature_cols):
-        # 找到该训练列名对应的数据库字段
-        db_col = None
-        for k, v in db_field_map.items():
-            if k == train_col:
-                db_col = v
-                break
+        db_col = db_field_map.get(train_col)
         if db_col is None or db_col not in feat_row.keys():
-            continue  # 未持久化的特征（如 weighted_res_diff）跳过
+            continue
 
         raw_value = feat_row[db_col]
         if raw_value is None:
@@ -196,13 +196,13 @@ def compute_feature_attribution(feat_row: sqlite3.Row, coef_data: dict, target: 
 
         display_name = FEATURE_DISPLAY_NAMES.get(train_col, train_col)
 
-        # 任务3：home_adv 在中立场地（raw_value == 0）时，贡献度直接归零，
-        # 跳过标准化×系数的通用计算路径，避免出现误导性的负贡献展示。
-        if train_col == "home_adv" and raw_value == 0:
+        # effective_home（由 home_adv 字段读取）在中立场（==0）时贡献归零：
+        # 中立场两队均不享有主场优势，展示贡献 0 比展示负贡献更符合业务直觉。
+        if train_col == "effective_home" and raw_value == 0:
             contributions.append((display_name, 0.0))
             continue
 
-        mean = means[i]
+        mean  = means[i]
         scale = scales[i] if scales[i] != 0 else 1.0
         standardized = (raw_value - mean) / scale
         contribution = standardized * coefs[i]
