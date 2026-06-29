@@ -11,15 +11,20 @@ Google Sheets 数据层，用于多用户决策日志存储（取代 SQLite 的 
 - Google Sheets 不可用时（凭证缺失、网络问题、API 配额等）不能让主应用崩溃，
   所有公开函数在失败时返回空结果并打印警告，调用方（app.py）据此降级展示。
 
-表头字段（与产品设计保持一致，对应原 SQLite decision_events 表 + AI 快照两个新增字段）：
+表头字段（Phase 1 扩展，共13列）：
     timestamp       决策写入时间（ISO格式字符串）
     user_name       用户昵称（取代原来的 session_id）
     match_id        比赛ID
     choice          用户选择：'home' / 'draw' / 'away'
     confidence      用户信心，1-5
-    reason          用户决策理由（自由文本）
+    reason          用户决策理由（下拉标签）
     ai_choice       写入决策时刻，AI 的预测结果：'home' / 'draw' / 'away'
     ai_confidence   写入决策时刻，AI 对该预测的置信度（0-1之间的概率，取AI预测结果对应的概率值）
+    predict_home    用户预测主队进球数（int）
+    predict_away    用户预测客队进球数（int）
+    predict_btts    用户预测是否双方都进球（bool）
+    predict_over25  用户预测总进球是否>2.5（bool）
+    comment         用户自由文本看法
 
 依赖：gspread, google-auth (oauth2client 已被 Google 官方弃用，改用 google-auth + google-auth-oauthlib)
 """
@@ -60,7 +65,8 @@ WORKSHEET_NAME = "Sheet1"
 
 SHEET_HEADERS = [
     "timestamp", "user_name", "match_id", "choice", "confidence",
-    "reason", "ai_choice", "ai_confidence"
+    "reason", "ai_choice", "ai_confidence",
+    "predict_home", "predict_away", "predict_btts", "predict_over25", "comment"
 ]
 
 SCOPES = [
@@ -266,9 +272,14 @@ def save_decision(user_name: str,
                   confidence,
                   reason: str = "",
                   ai_choice: str = "",
-                  ai_confidence=None) -> bool:
+                  ai_confidence=None,
+                  predict_home=None,
+                  predict_away=None,
+                  predict_btts=None,
+                  predict_over25=None,
+                  comment: str = "") -> bool:
     """
-    追加一条新的决策记录到 Google Sheets。
+    追加一条新的决策记录到 Google Sheets（共13列）。
     MVP 阶段不支持修改/覆盖已有记录——每次调用都是新增一行，
     即使同一用户对同一场比赛重复提交，也会保留多条历史（取最新一条作为当前决策，
     由调用方在读取时自行处理，本函数只负责追加）。
@@ -278,12 +289,20 @@ def save_decision(user_name: str,
         match_id        比赛ID（int 或 str 均可，写入时转为字符串）
         choice          用户选择：'home' / 'draw' / 'away'
         confidence      用户信心，1-5
-        reason          决策理由（可选，默认空字符串）
+        reason          决策理由标签（可选，默认空字符串）
         ai_choice       当时AI预测的结果，'home'/'draw'/'away'（可选）
         ai_confidence   当时AI对该预测结果的置信度，0-1之间的浮点数（可选）
+        predict_home    用户预测主队进球数（int，可选，默认None）
+        predict_away    用户预测客队进球数（int，可选，默认None）
+        predict_btts    用户预测是否双方都进球（bool，可选，默认None）
+        predict_over25  用户预测总进球是否>2.5（bool，可选，默认None）
+        comment         用户自由文本看法（str，可选，默认""）
 
     返回：True 表示写入成功，False 表示 Google Sheets 不可用或写入失败
          （此时不影响调用方继续运行，仅决策记录不会被持久化）。
+
+    向后兼容：旧代码调用 save_decision 时不传 predict_home 等新参数，
+    新参数的默认值确保旧调用不会报错，对应列写入空字符串。
     """
     ws = _get_worksheet()
     if ws is None:
@@ -291,14 +310,19 @@ def save_decision(user_name: str,
         return False
 
     row = [
-        datetime.now().isoformat(),
-        str(user_name),
-        str(match_id),
-        str(choice),
-        str(confidence) if confidence is not None else "",
-        str(reason) if reason else "",
-        str(ai_choice) if ai_choice else "",
-        f"{ai_confidence:.4f}" if isinstance(ai_confidence, (int, float)) else "",
+        datetime.now().isoformat(),                                                  # 列1:  timestamp
+        str(user_name),                                                              # 列2:  user_name
+        str(match_id),                                                               # 列3:  match_id
+        str(choice),                                                                 # 列4:  choice
+        str(confidence) if confidence is not None else "",                           # 列5:  confidence
+        str(reason) if reason else "",                                               # 列6:  reason
+        str(ai_choice) if ai_choice else "",                                         # 列7:  ai_choice
+        f"{ai_confidence:.4f}" if isinstance(ai_confidence, (int, float)) else "",  # 列8:  ai_confidence
+        str(predict_home) if predict_home is not None else "",                       # 列9:  predict_home
+        str(predict_away) if predict_away is not None else "",                       # 列10: predict_away
+        str(predict_btts) if predict_btts is not None else "",                       # 列11: predict_btts
+        str(predict_over25) if predict_over25 is not None else "",                   # 列12: predict_over25
+        str(comment) if comment else "",                                             # 列13: comment
     ]
 
     try:
