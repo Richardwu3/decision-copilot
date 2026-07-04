@@ -308,6 +308,9 @@ def render_review_center(conn: sqlite3.Connection, user_name: str):
                         st.write(f"信心：{decision.get('confidence')}/5")
                     if decision.get("reason"):
                         st.caption(f"理由：{decision.get('reason')}")
+                    # 任务2：显示 comment（安全读取，旧数据缺失该字段时不报错）
+                    if decision.get("comment", ""):
+                        st.caption(f"备注：{decision.get('comment', '')}")
 
             with c2:
                 st.write("**AI 预测**")

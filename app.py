@@ -236,6 +236,71 @@ def format_contribution_pct(contributions, top_pos=3, top_neg=2):
     return pos_strs, neg_strs
 
 
+# ============================================================
+# 任务1/4 新增：安全读取 + BTTS/Over2.5/其他高分比分
+# ============================================================
+
+def _safe_row_get(row, key, default=None):
+    """
+    安全读取 sqlite3.Row（没有 .get() 方法）或普通 dict 的字段。
+    row 为 None，或字段不存在/读取失败时返回 default。
+    """
+    if row is None:
+        return default
+    try:
+        if hasattr(row, "keys"):
+            return row[key] if key in row.keys() else default
+        return row.get(key, default)
+    except Exception:
+        return default
+
+
+def compute_extra_score_stats(lam_home, lam_away, rho: float = -0.13, max_goals: int = 8, top_n: int = 4):
+    """
+    任务1：基于 Dixon-Coles 比分矩阵计算 BTTS / Over 2.5 概率，以及概率最高
+    的 top_n 个比分（用于中栏"其他高分比分"展示，排除最可能比分后取第2/3高）。
+
+    复用 shared_utils._dc_tau 的修正项，与 most_likely_score 保持同一套
+    Dixon-Coles 口径，不在本文件重新定义 tau 修正逻辑（避免两处口径漂移）。
+
+    lam_home / lam_away 缺失（None）时返回 None，调用方据此展示"数据不足"。
+
+    返回：{"btts": float, "over25": float, "top_scores": [(home_g, away_g, prob), ...]}
+         top_scores 按概率降序排列，长度最多为 top_n。
+    """
+    if lam_home is None or lam_away is None:
+        return None
+
+    from scipy.stats import poisson
+    import numpy as np
+    from shared_utils import _dc_tau
+
+    mat = np.zeros((max_goals + 1, max_goals + 1))
+    for i in range(max_goals + 1):
+        for j in range(max_goals + 1):
+            p = poisson.pmf(i, lam_home) * poisson.pmf(j, lam_away)
+            mat[i, j] = p * _dc_tau(i, j, lam_home, lam_away, rho)
+
+    total = mat.sum()
+    if total <= 0:
+        return None
+    mat /= total
+
+    btts = float(mat[1:, 1:].sum())
+    over25 = float(sum(
+        mat[i, j]
+        for i in range(max_goals + 1)
+        for j in range(max_goals + 1)
+        if i + j >= 3
+    ))
+
+    flat = [(i, j, float(mat[i, j])) for i in range(max_goals + 1) for j in range(max_goals + 1)]
+    flat.sort(key=lambda x: -x[2])
+    top_scores = [(int(i), int(j), p) for i, j, p in flat[:top_n]]
+
+    return {"btts": btts, "over25": over25, "top_scores": top_scores}
+
+
 def needs_review(prob_home, prob_draw, prob_away, has_decision) -> bool:
     """
     判断是否"需要复查"：模型给出高置信度观点（任一结果概率 >= 55%），
@@ -641,8 +706,12 @@ def render_match_detail(conn: sqlite3.Connection, match_id, user_name: str):
         ai_choice, ai_confidence = get_ai_choice_and_confidence(
             pred["prob_home"], pred["prob_draw"], pred["prob_away"]
         )
+        # 任务1：提前计算 BTTS/Over2.5/top_scores，供中栏展示与任务4的快照写入共用，
+        # 避免在两处重复计算 Dixon-Coles 矩阵导致口径或数值不一致。
+        extra_stats = compute_extra_score_stats(pred["lambda_home"], pred["lambda_away"])
     else:
         ai_choice, ai_confidence = None, None
+        extra_stats = None
 
     # ============================================================
     # 三栏对比：左=用户决策，中=AI预测，右=博彩公司预测
@@ -657,6 +726,9 @@ def render_match_detail(conn: sqlite3.Connection, match_id, user_name: str):
             st.success(f"当前决策：**{latest.get('choice')}**　|　信心：{latest.get('confidence')}/5")
             if latest.get("reason"):
                 st.caption(f"理由：{latest.get('reason')}")
+            # 任务2：显示 comment（安全读取，旧数据缺失该字段时不报错）
+            if latest.get("comment", ""):
+                st.caption(f"备注：{latest.get('comment', '')}")
 
         with st.form(key=f"decision_form_{match_id}"):
             choice = st.radio(
@@ -727,6 +799,36 @@ def render_match_detail(conn: sqlite3.Connection, match_id, user_name: str):
             submitted = st.form_submit_button("保存决策")
 
             if submitted:
+                # ---- 任务4：AI / 市场快照，全部安全读取，缺失时传 None ----
+                ai_home_prob = _safe_row_get(pred, "prob_home")
+                ai_draw_prob = _safe_row_get(pred, "prob_draw")
+                ai_away_prob = _safe_row_get(pred, "prob_away")
+                ai_btts_prob = extra_stats.get("btts") if extra_stats else None
+                ai_over25_prob = extra_stats.get("over25") if extra_stats else None
+
+                ai_top_score_1 = None
+                ai_top_score_1_prob = None
+                ai_top_score_2 = None
+                ai_top_score_2_prob = None
+                if extra_stats and extra_stats.get("top_scores"):
+                    scores = extra_stats["top_scores"]
+                    if len(scores) >= 1:
+                        h1, a1, p1 = scores[0]
+                        ai_top_score_1 = f"{h1}-{a1}"
+                        ai_top_score_1_prob = p1
+                    if len(scores) >= 2:
+                        h2, a2, p2 = scores[1]
+                        ai_top_score_2 = f"{h2}-{a2}"
+                        ai_top_score_2_prob = p2
+
+                market_home_prob = odds_info.get("p_home") if odds_info else None
+                market_draw_prob = odds_info.get("p_draw") if odds_info else None
+                market_away_prob = odds_info.get("p_away") if odds_info else None
+
+                home_odds = odds_raw.get("odd_win") if odds_raw else None
+                draw_odds = odds_raw.get("odd_draw") if odds_raw else None
+                away_odds = odds_raw.get("odd_lose") if odds_raw else None
+
                 ok = save_decision(
                     user_name=user_name,
                     match_id=match_id,
@@ -740,6 +842,21 @@ def render_match_detail(conn: sqlite3.Connection, match_id, user_name: str):
                     predict_btts=predict_btts,
                     predict_over25=predict_over25,
                     comment=comment,
+                    ai_home_prob=ai_home_prob,
+                    ai_draw_prob=ai_draw_prob,
+                    ai_away_prob=ai_away_prob,
+                    ai_btts_prob=ai_btts_prob,
+                    ai_over25_prob=ai_over25_prob,
+                    ai_top_score_1=ai_top_score_1,
+                    ai_top_score_1_prob=ai_top_score_1_prob,
+                    ai_top_score_2=ai_top_score_2,
+                    ai_top_score_2_prob=ai_top_score_2_prob,
+                    market_home_prob=market_home_prob,
+                    market_draw_prob=market_draw_prob,
+                    market_away_prob=market_away_prob,
+                    home_odds=home_odds,
+                    draw_odds=draw_odds,
+                    away_odds=away_odds,
                 )
                 if ok:
                     invalidate_user_history_cache()  # 任务7：写入成功后让缓存失效
@@ -767,6 +884,25 @@ def render_match_detail(conn: sqlite3.Connection, match_id, user_name: str):
 
             best_h, best_a, best_p = most_likely_score(pred["lambda_home"], pred["lambda_away"])
             st.write(f"**最可能比分**：{best_h}-{best_a} ({best_p*100:.1f}%)")
+
+            # ---- 任务1新增：BTTS / Over 2.5 / 其他高分比分 ----
+            if extra_stats is not None:
+                st.write(f"BTTS：{extra_stats['btts']*100:.1f}%")
+                st.write(f"Over 2.5：{extra_stats['over25']*100:.1f}%")
+
+                other_scores = [
+                    (h, a, p) for h, a, p in extra_stats["top_scores"]
+                    if not (h == best_h and a == best_a)
+                ][:2]
+                if other_scores:
+                    other_str = ", ".join(f"{h}-{a} ({p*100:.1f}%)" for h, a, p in other_scores)
+                    st.caption(f"其他高分比分：{other_str}")
+                else:
+                    st.caption("其他高分比分：数据不足")
+            else:
+                st.write("BTTS：数据不足")
+                st.write("Over 2.5：数据不足")
+                st.caption("其他高分比分：数据不足")
 
             # ---- Phase 1 新增：Expected Value (EV) ----
             def _ev_stars(ev_pct: float) -> str:
@@ -826,10 +962,44 @@ def render_match_detail(conn: sqlite3.Connection, match_id, user_name: str):
     # ============================================================
     st.header("球队信息")
 
+    # ---- 时间感知升级：Elo 数据来源标注 ----
+    # pred（predictions 表最新一行）在数据库迁移后总是带有 elo_source /
+    # elo_home_used / elo_away_used 列；旧记录（迁移前写入、未重新跑过
+    # 预测流程）这些列会是 NULL，此时回退显示 matches 表的静态 Elo，
+    # 来源标注为"未知"，不假装知道那是历史数据还是最新数据。
+    _SOURCE_LABELS = {
+        "historical": "历史 Elo",
+        "latest": "最新 Elo",
+        "latest_fallback": "最新 Elo（历史数据缺失兜底）",
+        "unknown": "来源未知",
+    }
+
+    def _resolve_elo_display(used_value, fallback_value, source):
+        if used_value is not None:
+            return used_value, _SOURCE_LABELS.get(source or "unknown", "来源未知")
+        return fallback_value, _SOURCE_LABELS["unknown"]
+
+    pred_elo_source = None
+    pred_home_elo_used = None
+    pred_away_elo_used = None
+    if pred is not None:
+        pred_keys = pred.keys()
+        pred_elo_source = pred["elo_source"] if "elo_source" in pred_keys else None
+        pred_home_elo_used = pred["elo_home_used"] if "elo_home_used" in pred_keys else None
+        pred_away_elo_used = pred["elo_away_used"] if "elo_away_used" in pred_keys else None
+
+    home_elo_display, home_elo_label = _resolve_elo_display(
+        pred_home_elo_used, match["home_elo"], pred_elo_source
+    )
+    away_elo_display, away_elo_label = _resolve_elo_display(
+        pred_away_elo_used, match["away_elo"], pred_elo_source
+    )
+
     c1, c2 = st.columns(2)
     with c1:
         st.subheader(match["home_team"])
-        st.write(f"Elo：{match['home_elo']:.0f}")
+        st.write(f"Elo：{home_elo_display:.0f}")
+        st.caption(f"数据来源：{home_elo_label}")
         st.write(f"身价：€{match['home_value']:.1f}M")
         injured_home = get_injured_players(match["home_team"], match["date"])
         if injured_home:
@@ -838,7 +1008,8 @@ def render_match_detail(conn: sqlite3.Connection, match_id, user_name: str):
             st.caption("无伤病报告")
     with c2:
         st.subheader(match["away_team"])
-        st.write(f"Elo：{match['away_elo']:.0f}")
+        st.write(f"Elo：{away_elo_display:.0f}")
+        st.caption(f"数据来源：{away_elo_label}")
         st.write(f"身价：€{match['away_value']:.1f}M")
         injured_away = get_injured_players(match["away_team"], match["date"])
         if injured_away:

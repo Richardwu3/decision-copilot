@@ -66,7 +66,11 @@ WORKSHEET_NAME = "Sheet1"
 SHEET_HEADERS = [
     "timestamp", "user_name", "match_id", "choice", "confidence",
     "reason", "ai_choice", "ai_confidence",
-    "predict_home", "predict_away", "predict_btts", "predict_over25", "comment"
+    "predict_home", "predict_away", "predict_btts", "predict_over25", "comment",
+    "ai_home_prob", "ai_draw_prob", "ai_away_prob", "ai_btts_prob", "ai_over25_prob",
+    "ai_top_score_1", "ai_top_score_1_prob", "ai_top_score_2", "ai_top_score_2_prob",
+    "market_home_prob", "market_draw_prob", "market_away_prob",
+    "home_odds", "draw_odds", "away_odds",
 ]
 
 SCOPES = [
@@ -277,14 +281,29 @@ def save_decision(user_name: str,
                   predict_away=None,
                   predict_btts=None,
                   predict_over25=None,
-                  comment: str = "") -> bool:
+                  comment: str = "",
+                  ai_home_prob=None,
+                  ai_draw_prob=None,
+                  ai_away_prob=None,
+                  ai_btts_prob=None,
+                  ai_over25_prob=None,
+                  ai_top_score_1=None,
+                  ai_top_score_1_prob=None,
+                  ai_top_score_2=None,
+                  ai_top_score_2_prob=None,
+                  market_home_prob=None,
+                  market_draw_prob=None,
+                  market_away_prob=None,
+                  home_odds=None,
+                  draw_odds=None,
+                  away_odds=None) -> bool:
     """
-    追加一条新的决策记录到 Google Sheets（共13列）。
+    追加一条新的决策记录到 Google Sheets（共28列）。
     MVP 阶段不支持修改/覆盖已有记录——每次调用都是新增一行，
     即使同一用户对同一场比赛重复提交，也会保留多条历史（取最新一条作为当前决策，
     由调用方在读取时自行处理，本函数只负责追加）。
 
-    参数：
+    参数（列1-13，原有字段，含义不变）：
         user_name       用户昵称
         match_id        比赛ID（int 或 str 均可，写入时转为字符串）
         choice          用户选择：'home' / 'draw' / 'away'
@@ -298,16 +317,32 @@ def save_decision(user_name: str,
         predict_over25  用户预测总进球是否>2.5（bool，可选，默认None）
         comment         用户自由文本看法（str，可选，默认""）
 
+    参数（列14-28，本次新增，全部默认None，追加在comment之后，
+          不改变前13个参数的位置，旧代码按位置调用不受影响）：
+        ai_home_prob / ai_draw_prob / ai_away_prob   写入决策时刻AI的WDL概率
+        ai_btts_prob / ai_over25_prob                写入决策时刻AI的BTTS/Over2.5概率
+        ai_top_score_1 / ai_top_score_1_prob         AI当时最可能比分及其概率
+        ai_top_score_2 / ai_top_score_2_prob         AI当时第二可能比分及其概率
+        market_home_prob / market_draw_prob / market_away_prob
+                                                       写入决策时刻博彩隐含概率（归一化后）
+        home_odds / draw_odds / away_odds             写入决策时刻原始美式赔率
+
     返回：True 表示写入成功，False 表示 Google Sheets 不可用或写入失败
          （此时不影响调用方继续运行，仅决策记录不会被持久化）。
 
-    向后兼容：旧代码调用 save_decision 时不传 predict_home 等新参数，
-    新参数的默认值确保旧调用不会报错，对应列写入空字符串。
+    向后兼容：所有新参数默认 None，旧代码调用 save_decision 时不传这些参数
+    不会报错，对应列写入空字符串。
     """
     ws = _get_worksheet()
     if ws is None:
         print("[db.py] 警告：Google Sheets 不可用，本次决策未被持久化。")
         return False
+
+    def _fmt_float(v):
+        return f"{v:.4f}" if isinstance(v, (int, float)) else ""
+
+    def _fmt_str(v):
+        return str(v) if v is not None else ""
 
     row = [
         datetime.now().isoformat(),                                                  # 列1:  timestamp
@@ -323,6 +358,21 @@ def save_decision(user_name: str,
         str(predict_btts) if predict_btts is not None else "",                       # 列11: predict_btts
         str(predict_over25) if predict_over25 is not None else "",                   # 列12: predict_over25
         str(comment) if comment else "",                                             # 列13: comment
+        _fmt_float(ai_home_prob),                                                    # 列14: ai_home_prob
+        _fmt_float(ai_draw_prob),                                                    # 列15: ai_draw_prob
+        _fmt_float(ai_away_prob),                                                    # 列16: ai_away_prob
+        _fmt_float(ai_btts_prob),                                                    # 列17: ai_btts_prob
+        _fmt_float(ai_over25_prob),                                                  # 列18: ai_over25_prob
+        _fmt_str(ai_top_score_1),                                                    # 列19: ai_top_score_1
+        _fmt_float(ai_top_score_1_prob),                                             # 列20: ai_top_score_1_prob
+        _fmt_str(ai_top_score_2),                                                    # 列21: ai_top_score_2
+        _fmt_float(ai_top_score_2_prob),                                             # 列22: ai_top_score_2_prob
+        _fmt_float(market_home_prob),                                                # 列23: market_home_prob
+        _fmt_float(market_draw_prob),                                                # 列24: market_draw_prob
+        _fmt_float(market_away_prob),                                                # 列25: market_away_prob
+        _fmt_str(home_odds),                                                         # 列26: home_odds
+        _fmt_str(draw_odds),                                                         # 列27: draw_odds
+        _fmt_str(away_odds),                                                         # 列28: away_odds
     ]
 
     try:

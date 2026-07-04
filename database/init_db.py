@@ -66,16 +66,27 @@ CREATE TABLE IF NOT EXISTS matches (
 );
 
 -- 2. 模型预测表：每次模型运行产生的核心预测结果
+-- 时间感知升级（本次新增 6 列，用于记录"这次预测的时间基准与数据来源"）：
+--   prediction_date / elo_source / elo_home_used / elo_away_used /
+--   value_home_used / value_away_used
+-- 这些列全部可为空或带默认值，旧记录（迁移前写入的行）读取时
+-- elo_source 默认为 'unknown'，其余为 NULL，向后兼容。
 CREATE TABLE IF NOT EXISTS predictions (
-    pred_id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    match_id       INTEGER,
-    pred_date      TIMESTAMP,
-    model_version  TEXT,
-    prob_home      REAL,
-    prob_draw      REAL,
-    prob_away      REAL,
-    lambda_home    REAL,
-    lambda_away    REAL,
+    pred_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id          INTEGER,
+    pred_date         TIMESTAMP,
+    model_version     TEXT,
+    prob_home         REAL,
+    prob_draw         REAL,
+    prob_away         REAL,
+    lambda_home       REAL,
+    lambda_away       REAL,
+    prediction_date   DATE,
+    elo_source        TEXT DEFAULT 'unknown',
+    elo_home_used     REAL,
+    elo_away_used     REAL,
+    value_home_used   REAL,
+    value_away_used   REAL,
     FOREIGN KEY (match_id) REFERENCES matches(match_id)
 );
 

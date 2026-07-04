@@ -12,6 +12,13 @@ db_utils.py
   因为这是数据库的统一命名约定；写入时由调用方把
   worldcup_predictor_v2.py 里的 log_value_ratio 值传给 value_ratio 参数即可，
   不改变该值本身的含义或计算方式。
+
+时间感知升级（本次新增）：
+- predictions 表新增 6 列，用于记录"这次预测是在哪个 prediction_date 下，
+  用了历史快照还是最新快照"：prediction_date / elo_source /
+  elo_home_used / elo_away_used / value_home_used / value_away_used。
+- 已有数据库如果缺这些列，ensure_database_schema() 会用 ALTER TABLE
+  ADD COLUMN 就地补全（不会删除/重建数据库，见该函数文档）。
 """
 
 import sqlite3
@@ -35,6 +42,10 @@ EXPECTED_SCHEMA = {
     "predictions": {
         "pred_id", "match_id", "pred_date", "model_version",
         "prob_home", "prob_draw", "prob_away", "lambda_home", "lambda_away",
+        # 时间感知升级新增列：
+        "prediction_date", "elo_source",
+        "elo_home_used", "elo_away_used",
+        "value_home_used", "value_away_used",
     },
     "prediction_features": {
         "feature_id", "match_id", "pred_date", "elo_diff", "value_ratio",
@@ -47,6 +58,26 @@ EXPECTED_SCHEMA = {
     },
     "results": {
         "match_id", "home_goals", "away_goals", "result", "is_finished",
+    },
+}
+
+# ============================================================
+# 可安全"就地新增"的列（ALTER TABLE ADD COLUMN，不删除任何数据）。
+# 只有出现在这里的列，在旧数据库上缺失时会被自动 ADD COLUMN 补全；
+# EXPECTED_SCHEMA 中出现但不在这里的列若缺失，说明是比这次升级更早、
+# 更根本的结构缺失（旧版本 schema 不兼容），仍然走原有的
+# "删除并重建"兜底逻辑（见 ensure_database_schema）。
+# 类型字符串会被直接拼进 "ALTER TABLE t ADD COLUMN col <TYPE>"，
+# 因此只能用 SQLite 支持"非常量表达式以外"的 DEFAULT（字面量/NULL）。
+# ============================================================
+MIGRATION_ADDABLE_COLUMNS = {
+    "predictions": {
+        "prediction_date":  "DATE",
+        "elo_source":       "TEXT DEFAULT 'unknown'",
+        "elo_home_used":    "REAL",
+        "elo_away_used":    "REAL",
+        "value_home_used":  "REAL",
+        "value_away_used":  "REAL",
     },
 }
 
@@ -77,20 +108,24 @@ def _get_existing_columns(conn: sqlite3.Connection, table: str) -> set:
 def ensure_database_schema(conn: sqlite3.Connection, db_path: str = DB_PATH) -> sqlite3.Connection:
     """
     保证数据库 schema 完整、可用，不依赖"数据库文件是否存在"这个前提
-    （这正是本次 Streamlit Cloud 报错的根因：sqlite3.connect() 在文件
+    （这正是 Streamlit Cloud 报错的根因：sqlite3.connect() 在文件
     不存在时会静默创建一个 0 张表的空文件，旧的判断逻辑"文件存在就跳过初始化"
     完全检测不出这种情况）。
 
-    检查策略（两层）：
+    检查策略（三层，按"越不破坏数据越优先"排序）：
       1. 轻量修复：任何期望的表不存在 -> 执行 CREATE TABLE IF NOT EXISTS
-         （这一步本身幂等无害，可以放心在每次应用启动时都跑一遍）。
-      2. 重型修复（兜底）：表存在，但其中任何一个必需列缺失
-         -> 说明这是一个结构不兼容的旧版本残留数据库文件，
-            直接删除该数据库文件，重新执行完整 init_database()。
-         这种情况在 MVP 阶段选择"重建优于自动 ALTER"，因为：
-           - 自动推导每一列的 ALTER TABLE ADD COLUMN 语句、处理列类型变化、
-             处理删除列（SQLite 早期版本不支持 DROP COLUMN）等情况复杂度高；
-           - 当前数据量小，重建成本远低于维护一套通用 migration 引擎的成本。
+         （幂等无害，可以放心在每次应用启动时都跑一遍）。
+      2. 就地迁移（本次新增，替代了旧版本"缺列就删库重建"的行为）：
+         表存在但缺列时，若缺失的列都在 MIGRATION_ADDABLE_COLUMNS 里
+         登记过（当前仅 predictions 表的时间感知新增列），逐列执行
+         ALTER TABLE ADD COLUMN 就地补全 —— 不删除、不清空任何已有数据；
+         SQLite 对带字面量 DEFAULT 的 ADD COLUMN 会自动把该默认值回填到
+         所有已有行（因此旧记录的 elo_source 会自动变成 'unknown'，
+         符合"向后兼容默认值"的要求）。
+      3. 重型修复（兜底，仅在缺失列不在可迁移清单内时触发）：
+         说明这是比本次升级更早、更根本的结构不兼容（例如核心列缺失），
+         此时才退回到"删除数据库文件、重新 init_database()"的旧行为。
+         正常升级路径（本次新增列）不会走到这一步。
 
     返回：处理后的同一个 conn（仍然可以继续使用，未关闭）。
     """
@@ -117,13 +152,33 @@ def ensure_database_schema(conn: sqlite3.Connection, db_path: str = DB_PATH) -> 
 
         actual_cols = _get_existing_columns(conn, table)
         missing_cols = expected_cols - actual_cols
-        if missing_cols:
+        if not missing_cols:
+            continue
+
+        addable = set(MIGRATION_ADDABLE_COLUMNS.get(table, {}).keys())
+        safely_migratable = missing_cols & addable
+        unmigratable = missing_cols - addable
+
+        if safely_migratable:
+            print(f"[ensure_database_schema] 表 {table} 缺失可就地迁移的列："
+                  f"{safely_migratable}，执行 ALTER TABLE ADD COLUMN（不影响已有数据）。")
+            for col in sorted(safely_migratable):
+                col_type = MIGRATION_ADDABLE_COLUMNS[table][col]
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+                    conn.commit()
+                    print(f"    + {table}.{col} {col_type} 已添加。")
+                except sqlite3.OperationalError as e:
+                    # 例如并发场景下列已被其他进程加上，忽略"duplicate column"类错误
+                    print(f"    ! 添加 {table}.{col} 时出现异常（可能已存在，忽略）：{e}")
+
+        if unmigratable:
             schema_broken = True
-            print(f"[ensure_database_schema] 表 {table} 缺失列：{missing_cols}，"
-                  f"判定为结构不兼容的旧版本 schema。")
+            print(f"[ensure_database_schema] 表 {table} 缺失列：{unmigratable}，"
+                  f"不在可就地迁移清单内，判定为结构不兼容的旧版本 schema。")
 
     if schema_broken:
-        print(f"[ensure_database_schema] 数据库结构与当前代码不兼容，"
+        print(f"[ensure_database_schema] 数据库结构与当前代码不兼容（且无法就地迁移），"
               f"删除并重建：{db_path}")
         conn.close()
         if os.path.exists(db_path):
@@ -132,7 +187,7 @@ def ensure_database_schema(conn: sqlite3.Connection, db_path: str = DB_PATH) -> 
         conn = get_connection(db_path)
         print(f"[ensure_database_schema] 数据库已重建完成。")
     else:
-        print(f"[ensure_database_schema] 数据库 schema 校验通过，共 "
+        print(f"[ensure_database_schema] 数据库 schema 校验通过（含就地迁移），共 "
               f"{len(EXPECTED_SCHEMA)} 张表均完整。")
 
     return conn
@@ -223,22 +278,46 @@ def save_prediction(conn: sqlite3.Connection,
                     prob_away: float,
                     lambda_home: float,
                     lambda_away: float,
-                    pred_date=None) -> int:
+                    pred_date=None,
+                    prediction_date=None,
+                    elo_source: str = "unknown",
+                    elo_home_used: float = None,
+                    elo_away_used: float = None,
+                    value_home_used: float = None,
+                    value_away_used: float = None) -> int:
     """
     写入一次模型预测结果，返回新插入行的 pred_id。
     每次调用都会新增一条记录（同一场比赛允许有多个历史预测版本）。
+
+    时间感知升级新增参数（均为可选，向后兼容旧调用方）：
+      prediction_date  — 生成这次预测时使用的 prediction_date（显式基准日，
+                          与 pred_date/写入时间戳不同：pred_date 是"这条记录
+                          何时被写入数据库"，prediction_date 是"预测逻辑上
+                          假设自己站在哪一天"，两者在离线批量回测时可能不同）。
+      elo_source        — "historical" | "latest" | "latest_fallback" | "unknown"
+      elo_home_used / elo_away_used     — 本次预测实际使用的主/客队 Elo
+      value_home_used / value_away_used — 本次预测实际使用的主/客队身价
+    旧调用方不传这些参数时，写入 NULL / 'unknown'，不影响任何现有调用。
     """
     pred_date = pred_date or datetime.now()
     cur = conn.execute(
         """
         INSERT INTO predictions
             (match_id, pred_date, model_version,
-             prob_home, prob_draw, prob_away, lambda_home, lambda_away)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             prob_home, prob_draw, prob_away, lambda_home, lambda_away,
+             prediction_date, elo_source,
+             elo_home_used, elo_away_used, value_home_used, value_away_used)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (match_id, str(pred_date), model_version,
          float(prob_home), float(prob_draw), float(prob_away),
-         float(lambda_home), float(lambda_away))
+         float(lambda_home), float(lambda_away),
+         str(prediction_date) if prediction_date is not None else None,
+         elo_source,
+         float(elo_home_used) if elo_home_used is not None else None,
+         float(elo_away_used) if elo_away_used is not None else None,
+         float(value_home_used) if value_home_used is not None else None,
+         float(value_away_used) if value_away_used is not None else None)
     )
     conn.commit()
     return cur.lastrowid
