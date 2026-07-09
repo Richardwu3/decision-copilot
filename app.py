@@ -829,6 +829,26 @@ def render_match_detail(conn: sqlite3.Connection, match_id, user_name: str):
                 draw_odds = odds_raw.get("odd_draw") if odds_raw else None
                 away_odds = odds_raw.get("odd_lose") if odds_raw else None
 
+                # ---- Value Lab 新增：EV 快照，EV = AI概率 / 市场概率 - 1 ----
+                # 公式与本页面中栏"Expected Value (EV)"展示部分完全一致（见下方
+                # render_match_detail 中 col_ai 里的 ev_home/ev_draw/ev_away 计算），
+                # 确保写入 Google Sheets 的快照与用户当时在屏幕上看到的 EV 一致，
+                # 供 Value Lab 回测时直接使用，不必事后重算。
+                ev_home_snapshot = None
+                ev_draw_snapshot = None
+                ev_away_snapshot = None
+                if (market_home_prob and market_draw_prob and market_away_prob
+                        and ai_home_prob is not None and ai_draw_prob is not None
+                        and ai_away_prob is not None):
+                    try:
+                        ev_home_snapshot = ai_home_prob / market_home_prob - 1
+                        ev_draw_snapshot = ai_draw_prob / market_draw_prob - 1
+                        ev_away_snapshot = ai_away_prob / market_away_prob - 1
+                    except Exception:
+                        ev_home_snapshot = None
+                        ev_draw_snapshot = None
+                        ev_away_snapshot = None
+
                 ok = save_decision(
                     user_name=user_name,
                     match_id=match_id,
@@ -857,6 +877,9 @@ def render_match_detail(conn: sqlite3.Connection, match_id, user_name: str):
                     home_odds=home_odds,
                     draw_odds=draw_odds,
                     away_odds=away_odds,
+                    ev_home=ev_home_snapshot,
+                    ev_draw=ev_draw_snapshot,
+                    ev_away=ev_away_snapshot,
                 )
                 if ok:
                     invalidate_user_history_cache()  # 任务7：写入成功后让缓存失效
@@ -1126,9 +1149,9 @@ def main():
     _auto_import_results_if_needed(get_db_connection())
 
     # ---- st.navigation 多页面入口 ----
-    # Dashboard（本文件）与 Review Center（pages/review.py）通过 st.navigation
-    # 统一注册，取代旧版 Streamlit 仅靠 pages/ 目录文件名自动发现导航项的方式，
-    # 可以自定义标题、图标，且导航结构在代码中显式可见。
+    # Dashboard（本文件）、Review Center（review.py）与 Value Lab（value_lab.py）
+    # 通过 st.navigation 统一注册，取代旧版 Streamlit 仅靠 pages/ 目录文件名
+    # 自动发现导航项的方式，可以自定义标题、图标，且导航结构在代码中显式可见。
     dashboard_page = st.Page(
         run_dashboard_page,
         title="Dashboard",
@@ -1140,8 +1163,13 @@ def main():
         title="Review Center",
         icon="📋",
     )
+    value_lab_page = st.Page(
+        "value_lab.py",
+        title="Value Lab",
+        icon="📊",
+    )
 
-    nav = st.navigation([dashboard_page, review_page])
+    nav = st.navigation([dashboard_page, review_page, value_lab_page])
     nav.run()
 
 

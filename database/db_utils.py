@@ -525,3 +525,54 @@ def get_match_full_context(conn: sqlite3.Connection, match_id: int):
         "features": feat_row,
         "result": result_row,
     }
+
+
+def get_elo_map_for_matches(conn: sqlite3.Connection, match_ids: list) -> dict:
+    """
+    Value Lab Diagnostics 用：一次性批量查询多场比赛的 Elo 快照，
+    避免逐场调用 get_match_full_context / 逐场查 SQLite
+    （例如 96 场比赛的场景下，从 96 次查询降为 1 次）。
+
+    match_ids 可以混杂字符串/整数（Google Sheet 里的 match_id 是字符串，
+    SQLite 主键是整数），本函数内部统一转成 int 再查询，转换失败的
+    id 会被静默跳过（不会导致整体查询失败）。
+
+    返回：{match_id(int): {"home_elo": float|None, "away_elo": float|None}}
+    match_ids 为空、查询失败、或该批比赛在 matches 表里都没有 Elo 时，
+    返回空字典（调用方据此判断 Elo 数据整体不可用），不抛异常，
+    不影响 Value Lab 其余功能正常运行。
+    """
+    if not match_ids:
+        return {}
+
+    normalized_ids = []
+    seen = set()
+    for mid in match_ids:
+        try:
+            mid_int = int(mid)
+        except (TypeError, ValueError):
+            continue
+        if mid_int not in seen:
+            seen.add(mid_int)
+            normalized_ids.append(mid_int)
+
+    if not normalized_ids:
+        return {}
+
+    try:
+        placeholders = ",".join("?" for _ in normalized_ids)
+        cur = conn.execute(
+            f"SELECT match_id, home_elo, away_elo FROM matches WHERE match_id IN ({placeholders})",
+            normalized_ids,
+        )
+        result = {}
+        for row in cur.fetchall():
+            result[row["match_id"]] = {
+                "home_elo": row["home_elo"],
+                "away_elo": row["away_elo"],
+            }
+        return result
+    except Exception as e:
+        print(f"[db_utils.py] 警告：批量查询 Elo 失败（{e}），"
+              f"Value Lab Diagnostics 的「按Elo差距分层」诊断表将不可用。")
+        return {}

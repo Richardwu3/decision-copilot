@@ -11,7 +11,7 @@ Google Sheets 数据层，用于多用户决策日志存储（取代 SQLite 的 
 - Google Sheets 不可用时（凭证缺失、网络问题、API 配额等）不能让主应用崩溃，
   所有公开函数在失败时返回空结果并打印警告，调用方（app.py）据此降级展示。
 
-表头字段（Phase 1 扩展，共13列）：
+表头字段（Phase 1 扩展，共13列；Value Lab 扩展新增 ev_home/ev_draw/ev_away，共31列）：
     timestamp       决策写入时间（ISO格式字符串）
     user_name       用户昵称（取代原来的 session_id）
     match_id        比赛ID
@@ -71,6 +71,11 @@ SHEET_HEADERS = [
     "ai_top_score_1", "ai_top_score_1_prob", "ai_top_score_2", "ai_top_score_2_prob",
     "market_home_prob", "market_draw_prob", "market_away_prob",
     "home_odds", "draw_odds", "away_odds",
+    # Value Lab 新增（第29-31列）：决策时刻的 EV 快照，EV = AI概率 / 市场概率 - 1，
+    # 与 app.py Match Detail 页面 AI 预测栏展示的 EV 使用完全相同的公式，
+    # 目的是让 Value Lab 回测时能直接使用"用户当时看到的EV"，
+    # 而不是事后用当前模型/赔率重新计算（避免数据穿越）。
+    "ev_home", "ev_draw", "ev_away",
 ]
 
 SCOPES = [
@@ -296,9 +301,12 @@ def save_decision(user_name: str,
                   market_away_prob=None,
                   home_odds=None,
                   draw_odds=None,
-                  away_odds=None) -> bool:
+                  away_odds=None,
+                  ev_home=None,
+                  ev_draw=None,
+                  ev_away=None) -> bool:
     """
-    追加一条新的决策记录到 Google Sheets（共28列）。
+    追加一条新的决策记录到 Google Sheets（共31列）。
     MVP 阶段不支持修改/覆盖已有记录——每次调用都是新增一行，
     即使同一用户对同一场比赛重复提交，也会保留多条历史（取最新一条作为当前决策，
     由调用方在读取时自行处理，本函数只负责追加）。
@@ -326,6 +334,13 @@ def save_decision(user_name: str,
         market_home_prob / market_draw_prob / market_away_prob
                                                        写入决策时刻博彩隐含概率（归一化后）
         home_odds / draw_odds / away_odds             写入决策时刻原始美式赔率
+
+    参数（列29-31，Value Lab 新增，全部默认None，追加在away_odds之后，
+          不改变前28个参数的位置，旧代码按位置调用不受影响）：
+        ev_home / ev_draw / ev_away   写入决策时刻的 Expected Value 快照
+                                       （EV = AI概率 / 市场概率 - 1），
+                                       供 Value Lab 回测直接使用，不必
+                                       在回测时重新计算，避免口径漂移。
 
     返回：True 表示写入成功，False 表示 Google Sheets 不可用或写入失败
          （此时不影响调用方继续运行，仅决策记录不会被持久化）。
@@ -373,6 +388,9 @@ def save_decision(user_name: str,
         _fmt_str(home_odds),                                                         # 列26: home_odds
         _fmt_str(draw_odds),                                                         # 列27: draw_odds
         _fmt_str(away_odds),                                                         # 列28: away_odds
+        _fmt_float(ev_home),                                                         # 列29: ev_home
+        _fmt_float(ev_draw),                                                         # 列30: ev_draw
+        _fmt_float(ev_away),                                                         # 列31: ev_away
     ]
 
     try:

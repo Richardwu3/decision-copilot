@@ -51,6 +51,7 @@ from shared_utils import (
     most_likely_score,
     get_ai_choice_and_confidence,
     get_cached_user_history,
+    compute_value_lab_results,
 )
 
 
@@ -265,6 +266,31 @@ def render_review_center(conn: sqlite3.Connection, user_name: str):
         )
     else:
         st.metric("ROI", "暂无数据", help="需要至少一场有赔率数据的已结束比赛")
+
+    # ---- 任务3新增：Value Bet Snapshot 摘要卡片 ----
+    # 复用 shared_utils.compute_value_lab_results（与 Value Lab 页面同一套
+    # 纯函数计算逻辑），保证这里展示的 ROI 与 Value Lab 页面完全一致，
+    # 这里只展示摘要，完整下注明细见 Value Lab 页面。
+    st.divider()
+    st.subheader("Value Bet Snapshot")
+
+    value_lab_data = compute_value_lab_results(user_name, conn)
+    vl_eligible_count = value_lab_data["eligible_count"]
+
+    if vl_eligible_count == 0:
+        st.caption("暂无可回测的比赛（需要至少一场已结束、且决策时保存了完整AI/市场/赔率快照的比赛）。")
+    else:
+        st.caption(f"基于 {vl_eligible_count} 场有快照的比赛")
+        for key in ("A", "B", "C"):
+            r = value_lab_data["strategies"][key]
+            if r["roi"] is not None:
+                sign = "+" if r["roi"] >= 0 else ""
+                roi_str = f"{sign}{r['roi']:.0f}%"
+            else:
+                roi_str = "暂无"
+            st.write(f"{r['label']}：{roi_str} ROI（{r['bet_count']} bets）")
+
+    st.page_link("value_lab.py", label="查看完整策略分析 →", icon="📊")
 
     st.divider()
 
