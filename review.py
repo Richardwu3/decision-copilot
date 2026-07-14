@@ -54,10 +54,109 @@ from shared_utils import (
     compute_value_lab_results,
 )
 
+# AI 复盘功能：review.py 只负责渲染按钮与四张卡结果，
+# 数据组装（decision_context_builder）与模型调用（ai_coach）
+# 全部在各自模块内完成，本文件不直接访问数据库/Google Sheets/Claude API。
+from decision_context_builder import build_decision_context
+from ai_coach import ClaudeCoach
+
 
 @st.cache_resource
 def get_db_connection() -> sqlite3.Connection:
     return get_connection()
+
+
+@st.cache_resource
+def get_ai_coach() -> ClaudeCoach:
+    """
+    全应用唯一的 ClaudeCoach 实例（@st.cache_resource 保证整个 session
+    只初始化一次 client，不必每次点击"AI复盘"都重新读取 API Key）。
+    """
+    return ClaudeCoach()
+
+
+# ============================================================
+# AI 复盘：按钮 + 四张卡渲染
+# ============================================================
+#
+# 结果按 (user_name, match_id) 缓存在 session_state 里，同一场比赛
+# 在本次 session 内只有点击按钮才会真正调用一次 Claude API，页面其他
+# 交互触发的 rerun 不会重复消耗 API 调用额度。
+
+_SESSION_KEY_AI_REVIEW_CACHE = "ai_review_cache"
+
+
+def _get_ai_review_cache() -> dict:
+    if _SESSION_KEY_AI_REVIEW_CACHE not in st.session_state:
+        st.session_state[_SESSION_KEY_AI_REVIEW_CACHE] = {}
+    return st.session_state[_SESSION_KEY_AI_REVIEW_CACHE]
+
+
+def _render_ai_review_section(user_name: str, match_id: str, match_ctx: dict, decision_record: dict):
+    """
+    在单场复盘卡片底部渲染"AI复盘"按钮与结果。
+
+    match_ctx / decision_record 直接复用 render_review_center 已经查询好的
+    数据（get_match_full_context 的返回值、build_user_decision_map 聚合出的
+    该场决策记录），传给 build_decision_context 后不会在 SQLite / Google
+    Sheets 上产生任何额外查询。
+    """
+    cache = _get_ai_review_cache()
+    cache_key = (user_name, match_id)
+
+    st.divider()
+    btn_label = "🔄 重新生成 AI 复盘" if cache_key in cache else "🤖 生成 AI 复盘"
+    clicked = st.button(btn_label, key=f"ai_review_btn_{match_id}")
+
+    if clicked:
+        coach = get_ai_coach()
+        ctx = build_decision_context(
+            user_name=user_name,
+            match_id=match_id,
+            match_ctx=match_ctx,
+            decision_record=decision_record,
+        )
+        with st.spinner("AI 教练分析中..."):
+            review = coach.generate_review(ctx)
+        cache[cache_key] = review
+
+    review = cache.get(cache_key)
+    if review is None:
+        return
+
+    if review.degraded:
+        st.info(f"ℹ️ {review.reasoning}")
+        return
+
+    score_col, reasoning_col = st.columns([1, 3])
+    with score_col:
+        st.write("**Decision Score**")
+        if review.decision_score is not None:
+            st.metric(label="决策评分", value=f"{review.decision_score}/100")
+        else:
+            st.caption("暂无评分")
+        if review.score_rationale:
+            st.caption(review.score_rationale)
+
+    with reasoning_col:
+        st.write("**Reasoning**")
+        st.write(review.reasoning or "（无）")
+
+    bias_col, rec_col = st.columns(2)
+    with bias_col:
+        st.write("**Bias**")
+        if review.biases:
+            for b in review.biases:
+                st.write(f"- {b}")
+        else:
+            st.caption("未识别出明显偏差。")
+    with rec_col:
+        st.write("**Recommendation**")
+        if review.recommendations:
+            for r in review.recommendations:
+                st.write(f"- {r}")
+        else:
+            st.caption("暂无具体建议。")
 
 
 # ============================================================
@@ -168,6 +267,10 @@ def render_review_center(conn: sqlite3.Connection, user_name: str):
             "result_code": result_row["result"],
             "decision": decision,
             "prediction": pred_row,
+            # AI复盘用：直接复用这里已经查询好的 get_match_full_context 结果，
+            # 传给 decision_context_builder.build_decision_context 时不再
+            # 重复查询 SQLite（见该函数 match_ctx 参数说明）。
+            "match_ctx": ctx,
         })
 
     if not review_items:
@@ -372,6 +475,15 @@ def render_review_center(conn: sqlite3.Connection, user_name: str):
                 st.write("**实际结果**")
                 st.write(f"{item['home_team']} {item['home_goals']} - {item['away_goals']} {item['away_team']}")
                 st.write(f"结果：{result_label_map.get(item['result_code'], '未知')}")
+
+            # ---- AI 复盘（仅对已决策的比赛可用；未决策则无需展示按钮）----
+            if decision is not None:
+                _render_ai_review_section(
+                    user_name=user_name,
+                    match_id=item["match_id"],
+                    match_ctx=item["match_ctx"],
+                    decision_record=decision,
+                )
 
 
 def main():
