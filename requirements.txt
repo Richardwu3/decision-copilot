@@ -16,3 +16,6 @@ scipy>=1.7.0
 scikit-learn>=1.0.0
 
 # 数据库（SQLite 内置，无需额外安装）
+
+# AI 复盘（Claude API）
+anthropic
