@@ -124,28 +124,39 @@ To test code locally:
    cd decision-copilot
 Install dependencies:
 
-bash
-pip install -r requirements.txt
-Configure API Keys (for AI Coach):
-Create a .streamlit/secrets.toml file in the project root:
+2. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-toml
-ANTHROPIC_API_KEY = "your-anthropic-api-key"
-Run the application:
+3. **Configure API Keys** (for AI Coach):
+   Create a `.streamlit/secrets.toml` file in the project root:
+   ```toml
+   ANTHROPIC_API_KEY = "your-anthropic-api-key"
+   ```
 
-bash
-streamlit run app.py
-Log in with any username (e.g., Richard) to start recording and reviewing decisions.
+4. **Run the application**:
+   ```bash
+   streamlit run app.py
+   ```
 
-📊 Model Performance (2026 World Cup)
-On 104 World Cup matches, the model demonstrated robust predictive power, slightly outperforming bookmaker probabilities in both Brier Score and RPS after calibration. 
-Brier 0.4518 vs bookmaker 0.4685
-RPS 0.1380 vs bookmaker 0.1482. 
-2300 matches training set: RMSE 1.1521, R^2 0.2382, 
-OOF test: Brier 0.5439, RPS 0.1855
+5. **Log in** with any username to start recording and reviewing decisions. My decisions available with username `Richard`
+
+## 📊 Model Performance (2026 World Cup)
+
+On 104 World Cup matches, the model demonstrated robust predictive power, slightly outperforming bookmaker probabilities in both Brier Score and RPS after calibration.
+
+| Metric | Decision Copilot (Calibrated) | Bookmaker |
+| :--- | :--- | :--- |
+| **Multiclass Brier Score** | **0.4518** | 0.4685 |
+| **RPS (Ranked Probability Score)** | **0.1380** | 0.1482 |
+
+**Additional Training & Validation Metrics:**
+*   **Training Set (2,300 matches)**: RMSE 1.1521, R² 0.2382
+*   **Out-of-Fold (OOF) Test**: Brier 0.5439, RPS 0.1855
 
 🙏 Acknowledgements
-Yujun (TA) for collaboration and feedback.
+Yujun for collaboration and feedback.
 
 Professor Julien Guyon for his inspiring work on tournament design, fairness, and decision science in sports.
 
